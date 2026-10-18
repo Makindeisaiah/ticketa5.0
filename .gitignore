@@ -1,0 +1,25 @@
+
+# Private credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Gmail SMTP credentials
+config/mail.php
+
+# Local database configuration
+config/database.local.php
+
+# Database backups and exports
+*.sql
+*.sql.zip
+*.bak
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
