@@ -429,21 +429,87 @@ try {
 
                 if ($memberId && $memberId > 0) {
                     if ($memberType === 'staff_assignment') {
-                        // Only revoke assignments belonging to this organizer's events.
-                        $stmt = $pdo->prepare(
-                            "UPDATE staff_event_assignments a
-                             INNER JOIN events e ON e.id = a.event_id
-                             SET a.status = 'revoked'
-                             WHERE a.id = :id
-                               AND e.organizer_id = :org"
-                        );
-                        $stmt->execute([
-                            'id' => $memberId,
-                            'org' => $organizerId
-                        ]);
-                        $success = $stmt->rowCount()
-                            ? 'Check-in staff access revoked.'
-                            : 'No matching staff assignment was found.';
+                        /*
+                         * For check-in staff, Revoke means remove them from this
+                         * organizer's platform list immediately. The staff account
+                         * is retained if it still has assignments with other organizers.
+                         */
+                        try {
+                            $pdo->beginTransaction();
+
+                            $stmt = $pdo->prepare(
+                                "SELECT a.staff_user_id, s.email AS staff_email
+                                 FROM staff_event_assignments a
+                                 INNER JOIN events e ON e.id = a.event_id
+                                 INNER JOIN staff_users s ON s.id = a.staff_user_id
+                                 WHERE a.id = :id
+                                   AND e.organizer_id = :org
+                                 LIMIT 1
+                                 FOR UPDATE"
+                            );
+                            $stmt->execute([
+                                'id' => $memberId,
+                                'org' => $organizerId
+                            ]);
+                            $staff = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                            if (!$staff) {
+                                $pdo->rollBack();
+                                $errors[] = 'No matching staff assignment was found.';
+                            } else {
+                                $staffUserId = (int) $staff['staff_user_id'];
+                                $staffEmail = trim((string) $staff['staff_email']);
+
+                                $stmt = $pdo->prepare(
+                                    'DELETE a
+                                     FROM staff_event_assignments a
+                                     INNER JOIN events e ON e.id = a.event_id
+                                     INNER JOIN staff_users s ON s.id = a.staff_user_id
+                                     WHERE e.organizer_id = :org
+                                       AND (a.staff_user_id = :staff_user_id
+                                            OR LOWER(TRIM(s.email)) = LOWER(TRIM(:staff_email)))'
+                                );
+                                $stmt->execute([
+                                    'org' => $organizerId,
+                                    'staff_user_id' => $staffUserId,
+                                    'staff_email' => $staffEmail
+                                ]);
+                                $removedCount = $stmt->rowCount();
+                                $pdo->commit();
+
+                                if ($removedCount > 0) {
+                                    $success = 'Check-in staff removed from your events.';
+
+                                    // Delete the staff login only if it is no longer
+                                    // assigned to any event. Preserve accounts still in use.
+                                    try {
+                                        $stmt = $pdo->prepare(
+                                            'SELECT COUNT(*) FROM staff_event_assignments WHERE staff_user_id = :id'
+                                        );
+                                        $stmt->execute(['id' => $staffUserId]);
+                                        if ((int) $stmt->fetchColumn() === 0) {
+                                            $stmt = $pdo->prepare('DELETE FROM staff_users WHERE id = :id');
+                                            $stmt->execute(['id' => $staffUserId]);
+                                            if ($stmt->rowCount() > 0) {
+                                                $success = 'Check-in staff and their staff account were deleted.';
+                                            }
+                                        }
+                                    } catch (Throwable $accountError) {
+                                        // Assignment removal already succeeded; retain
+                                        // the account if other records depend on it.
+                                        error_log('Ticketa staff account cleanup failed: ' . $accountError->getMessage());
+                                    }
+                                } else {
+                                    $errors[] = 'No staff assignments were removed. Please try again.';
+                                }
+                            }
+                        } catch (Throwable $e) {
+                            if ($pdo->inTransaction()) {
+                                $pdo->rollBack();
+                            }
+                            error_log('Ticketa staff revoke/remove failed: ' . $e->getMessage());
+                            $errors[] = 'The staff member could not be removed. Check the database setup and try again.';
+                        }
                     } else {
                         $stmt = $pdo->prepare(
                             "UPDATE organizer_team_members
@@ -458,6 +524,140 @@ try {
                         $success = $stmt->rowCount()
                             ? 'Team member access revoked.'
                             : 'No matching team membership was found.';
+                    }
+                }
+            } elseif ($action === 'delete_member') {
+                /*
+                 * PERMANENTLY DELETE A REVOKED MEMBER
+                 * For check-in staff, remove every assignment belonging to this
+                 * organizer, but preserve assignments belonging to other organizers.
+                 * Delete the global staff account only when no assignments remain.
+                 */
+                $memberId = filter_input(
+                    INPUT_POST,
+                    'member_id',
+                    FILTER_VALIDATE_INT
+                );
+                $memberType = $_POST['member_type'] ?? 'team_member';
+
+                if ($memberId && $memberId > 0) {
+                    if ($memberType === 'staff_assignment') {
+                        $staffUserId = 0;
+
+                        try {
+                            $pdo->beginTransaction();
+
+                            // Confirm the selected assignment is revoked and belongs
+                            // to an event owned by the currently logged-in organizer.
+                            $stmt = $pdo->prepare(
+                                "SELECT a.id, a.staff_user_id, s.email AS staff_email
+                                 FROM staff_event_assignments a
+                                 INNER JOIN events e ON e.id = a.event_id
+                                 INNER JOIN staff_users s ON s.id = a.staff_user_id
+                                 WHERE a.id = :id
+                                   AND e.organizer_id = :org
+                                   AND a.status = 'revoked'
+                                 LIMIT 1
+                                 FOR UPDATE"
+                            );
+                            $stmt->execute([
+                                'id' => $memberId,
+                                'org' => $organizerId
+                            ]);
+                            $assignment = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                            if (!$assignment) {
+                                $pdo->rollBack();
+                                $errors[] = 'Only revoked staff assigned to your events can be deleted.';
+                            } else {
+                                $staffUserId = (int) $assignment['staff_user_id'];
+                                $staffEmail = trim((string) $assignment['staff_email']);
+
+                                // Remove every assignment for this staff account AND
+                                // any duplicate staff account using the same email,
+                                // but only for events owned by this organizer. This
+                                // prevents a duplicate account/assignment from making
+                                // the same staff person reappear after deletion.
+                                $stmt = $pdo->prepare(
+                                    'DELETE a
+                                     FROM staff_event_assignments a
+                                     INNER JOIN events e ON e.id = a.event_id
+                                     INNER JOIN staff_users s ON s.id = a.staff_user_id
+                                     WHERE e.organizer_id = :org
+                                       AND (a.staff_user_id = :staff_user_id
+                                            OR LOWER(TRIM(s.email)) = LOWER(TRIM(:staff_email)))'
+                                );
+                                $stmt->execute([
+                                    'org' => $organizerId,
+                                    'staff_user_id' => $staffUserId,
+                                    'staff_email' => $staffEmail
+                                ]);
+
+                                $pdo->commit();
+                            }
+                        } catch (Throwable $e) {
+                            if ($pdo->inTransaction()) {
+                                $pdo->rollBack();
+                            }
+
+                            $staffUserId = 0;
+                            error_log('Ticketa staff delete failed: ' . $e->getMessage());
+                            $errors[] = 'The staff member could not be removed. Check the database setup and try again.';
+                        }
+
+                        if ($staffUserId > 0) {
+                            $success = 'Staff member permanently removed from all your events.';
+
+                            // Only delete the global account if it is no longer
+                            // assigned to any event on Ticketa. Other organizers'
+                            // assignments are never deleted by this action.
+                            try {
+                                $stmt = $pdo->prepare(
+                                    'SELECT COUNT(*)
+                                     FROM staff_event_assignments
+                                     WHERE staff_user_id = :id'
+                                );
+                                $stmt->execute(['id' => $staffUserId]);
+
+                                if ((int) $stmt->fetchColumn() === 0) {
+                                    $stmt = $pdo->prepare(
+                                        'DELETE FROM staff_users WHERE id = :id'
+                                    );
+                                    $stmt->execute(['id' => $staffUserId]);
+
+                                    if ($stmt->rowCount() > 0) {
+                                        $success = 'Staff member and their Ticketa staff account were permanently deleted.';
+                                    } else {
+                                        $success = 'Staff member removed from all your events. Their account was not found for deletion.';
+                                    }
+                                } else {
+                                    $success = 'Staff member removed from all your events. Their Ticketa account remains active for assignments with other organizers.';
+                                }
+                            } catch (Throwable $e) {
+                                // Assignment removal has succeeded. If the account
+                                // has other related records, retain it rather than
+                                // deleting historical check-in/audit data.
+                                error_log('Ticketa staff account delete failed: ' . $e->getMessage());
+                                $success = 'Staff member removed from all your events. Their account was retained because related records still depend on it.';
+                            }
+                        }
+                    } else {
+                        $stmt = $pdo->prepare(
+                            "DELETE FROM organizer_team_members
+                             WHERE id = :id
+                               AND organizer_id = :org
+                               AND status = 'revoked'"
+                        );
+                        $stmt->execute([
+                            'id' => $memberId,
+                            'org' => $organizerId
+                        ]);
+
+                        if ($stmt->rowCount()) {
+                            $success = 'Team member deleted.';
+                        } else {
+                            $errors[] = 'Only revoked team members can be deleted.';
+                        }
                     }
                 }
             }
@@ -773,8 +973,17 @@ body {
     border: 1px solid #d5d9dc;
     border-radius: 5px;
     background: white;
+    font: inherit;
+    font-size: 13px;
     cursor: pointer;
 }
+
+.small-action.danger {
+    border-color: #f1b9b9;
+    color: #b93232;
+}
+
+.small-action.danger:hover { background: #fff0f0; }
 
 .pending-row {
     display: flex;
@@ -903,6 +1112,52 @@ body {
     cursor: pointer;
 }
 
+/* Confirmation / message modal (replaces the browser's alert and confirm boxes) */
+#confirmModal { z-index: 2100; }
+
+.confirm-modal { width: min(460px, 100%); }
+.confirm-modal .modal-header { padding: 18px 22px; }
+.confirm-modal .modal-header h2 { font-size: 20px; }
+.confirm-modal .modal-body { padding: 20px 22px 6px; }
+
+.confirm-modal .modal-body p {
+    margin: 0;
+    color: #454950;
+    font-size: 15px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.confirm-modal .modal-footer {
+    gap: 10px;
+    padding: 18px 22px 22px;
+    border-top: 0;
+}
+
+.cancel-button {
+    min-height: 47px;
+    padding: 0 22px;
+    border: 1px solid #d5d9dc;
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+    font: inherit;
+    cursor: pointer;
+}
+
+.cancel-button:hover { background: #f4f5f6; }
+
+.submit-button.danger { background: #d33f3f; }
+.submit-button.danger:hover { background: #b93232; }
+
+.submit-button:focus-visible,
+.cancel-button:focus-visible,
+.small-action:focus-visible,
+.close:focus-visible {
+    outline: 3px solid #10bea055;
+    outline-offset: 2px;
+}
+
 [hidden] { display: none !important; }
 
 @media (max-width: 1200px) {
@@ -922,7 +1177,7 @@ body {
     }
 
     .person { grid-column: 1 / -1; }
-    .actions { justify-self: end; }
+    .actions, .delete-wrap { justify-self: end; }
 
     .modal-header, .modal-body {
         padding-right: 16px;
@@ -930,6 +1185,9 @@ body {
     }
 
     .guide-row { flex-wrap: wrap; }
+
+    .confirm-modal .modal-footer { flex-direction: column-reverse; }
+    .confirm-modal .modal-footer button { width: 100%; }
 }
 </style>
 </head>
@@ -989,7 +1247,8 @@ body {
 
     <?php foreach ($members as $member):
         $role = (string) $member['team_role'];
-        $status = $member['status'] === 'revoked'
+        $isRevoked = ($member['status'] === 'revoked');
+        $status = $isRevoked
             ? 'Revoked'
             : (((int) $member['is_active'] === 1 && $member['status'] === 'active')
                 ? 'Active'
@@ -1019,14 +1278,25 @@ body {
                 <?= teamEscape($status) ?>
             </span>
 
-            <div class="actions">
-                <button type="button" class="editRole" title="Edit role">✎</button>
-                <button type="button"
-                        class="revokeMember"
-                        data-id="<?= (int) $member['membership_id'] ?>"
-                        data-type="<?= teamEscape($member['member_type'] ?? 'team_member') ?>"
-                        title="Revoke access">•••</button>
-            </div>
+            <?php if ($isRevoked): ?>
+                <div class="delete-wrap">
+                    <button type="button"
+                            class="small-action danger deleteMember"
+                            data-id="<?= (int) $member['membership_id'] ?>"
+                            data-type="<?= teamEscape($member['member_type'] ?? 'team_member') ?>"
+                            data-name="<?= teamEscape($member['full_name']) ?>">Delete</button>
+                </div>
+            <?php else: ?>
+                <div class="actions">
+                    <button type="button" class="editRole" title="Edit role">✎</button>
+                    <button type="button"
+                            class="revokeMember"
+                            data-id="<?= (int) $member['membership_id'] ?>"
+                            data-type="<?= teamEscape($member['member_type'] ?? 'team_member') ?>"
+                            data-name="<?= teamEscape($member['full_name']) ?>"
+                            title="Revoke access">•••</button>
+                </div>
+            <?php endif; ?>
         </div>
     <?php endforeach; ?>
 
@@ -1058,7 +1328,10 @@ body {
                 </div>
 
                 <form method="post"
-                      onsubmit="return confirm('Revoke this invitation?')">
+                      class="js-confirm-form"
+                      data-title="Revoke invitation?"
+                      data-message="<?= teamEscape('The invitation sent to ' . $inv['email'] . ' will stop working. You can send a new one later.') ?>"
+                      data-button="Revoke invitation">
 
                     <input type="hidden" name="csrf_token" value="<?= teamEscape($csrf) ?>">
                     <input type="hidden" name="action" value="revoke_invitation">
@@ -1264,6 +1537,31 @@ body {
     </div>
 </div>
 
+<!-- Confirmation / message modal -->
+<div class="backdrop"
+     id="confirmModal"
+     role="alertdialog"
+     aria-modal="true"
+     aria-labelledby="confirmTitle"
+     aria-describedby="confirmMessage">
+
+    <div class="modal confirm-modal">
+        <div class="modal-header">
+            <h2 id="confirmTitle">Are you sure?</h2>
+            <button type="button" class="close" id="confirmClose" aria-label="Close">×</button>
+        </div>
+
+        <div class="modal-body">
+            <p id="confirmMessage"></p>
+        </div>
+
+        <div class="modal-footer">
+            <button type="button" class="cancel-button" id="confirmCancel">Cancel</button>
+            <button type="button" class="submit-button" id="confirmOk">Confirm</button>
+        </div>
+    </div>
+</div>
+
 <script>
 (function () {
     const modal = document.getElementById('inviteModal');
@@ -1277,6 +1575,18 @@ body {
     const shiftStart = document.getElementById('shiftStart');
     const shiftEnd = document.getElementById('shiftEnd');
     const inviteForm = document.getElementById('inviteForm');
+
+    const confirmModal = document.getElementById('confirmModal');
+    const confirmTitle = document.getElementById('confirmTitle');
+    const confirmMessage = document.getElementById('confirmMessage');
+    const confirmOk = document.getElementById('confirmOk');
+    const confirmCancel = document.getElementById('confirmCancel');
+    const confirmClose = document.getElementById('confirmClose');
+
+    let confirmResolve = null;
+    let confirmReturnFocus = null;
+
+    /* ---------- Invite modal ---------- */
 
     function showModal() {
         modal.classList.add('open');
@@ -1299,11 +1609,110 @@ body {
         }
     });
 
-    document.addEventListener('keydown', function (event) {
-        if (event.key === 'Escape' && modal.classList.contains('open')) {
-            hideModal();
+    /* ---------- Confirmation / message modal ----------
+       openConfirm() returns a Promise that resolves to true when the user
+       confirms and false when they cancel or dismiss the box.
+       Use infoOnly: true for a message with a single OK button. */
+
+    function openConfirm(options) {
+        return new Promise(function (resolve) {
+            confirmResolve = resolve;
+            confirmReturnFocus = document.activeElement;
+
+            confirmTitle.textContent = options.title || 'Are you sure?';
+            confirmMessage.textContent = options.message || '';
+
+            confirmOk.textContent = options.confirmText || 'Confirm';
+            confirmOk.className = 'submit-button' + (options.danger ? ' danger' : '');
+
+            confirmCancel.textContent = options.cancelText || 'Cancel';
+            confirmCancel.hidden = !!options.infoOnly;
+
+            confirmModal.classList.add('open');
+            document.body.style.overflow = 'hidden';
+
+            // For destructive actions, start on the safe choice.
+            (options.danger && !options.infoOnly ? confirmCancel : confirmOk).focus();
+        });
+    }
+
+    function closeConfirm(result) {
+        confirmModal.classList.remove('open');
+
+        if (!modal.classList.contains('open')) {
+            document.body.style.overflow = '';
+        }
+
+        const resolve = confirmResolve;
+        confirmResolve = null;
+
+        if (confirmReturnFocus && typeof confirmReturnFocus.focus === 'function') {
+            confirmReturnFocus.focus();
+        }
+
+        if (resolve) {
+            resolve(result);
+        }
+    }
+
+    confirmOk.addEventListener('click', function () { closeConfirm(true); });
+    confirmCancel.addEventListener('click', function () { closeConfirm(false); });
+    confirmClose.addEventListener('click', function () { closeConfirm(false); });
+
+    confirmModal.addEventListener('click', function (event) {
+        if (event.target === confirmModal) {
+            closeConfirm(false);
         }
     });
+
+    document.addEventListener('keydown', function (event) {
+        const confirmOpen = confirmModal.classList.contains('open');
+
+        if (event.key === 'Escape') {
+            if (confirmOpen) {
+                closeConfirm(false);
+            } else if (modal.classList.contains('open')) {
+                hideModal();
+            }
+            return;
+        }
+
+        // Keep Tab inside the confirmation box while it is open.
+        if (event.key === 'Tab' && confirmOpen) {
+            const focusable = [confirmClose, confirmCancel, confirmOk].filter(function (el) {
+                return !el.hidden;
+            });
+
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
+    });
+
+    function postAction(fields) {
+        const form = document.createElement('form');
+        form.method = 'post';
+
+        Object.entries(fields).forEach(function ([name, value]) {
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = name;
+            input.value = value;
+            form.appendChild(input);
+        });
+
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    /* ---------- Invite form ---------- */
 
     function updateStaffFields() {
         const isStaff = role.value === 'checkin_staff';
@@ -1331,7 +1740,13 @@ body {
             eventId.options.length <= 1
         ) {
             event.preventDefault();
-            alert('Create an event before inviting check-in staff.');
+
+            openConfirm({
+                title: 'Create an event first',
+                message: 'You need at least one event before you can invite check-in staff. Create an event, then come back to send the invitation.',
+                confirmText: 'OK',
+                infoOnly: true
+            });
         }
     });
 
@@ -1345,38 +1760,89 @@ body {
         });
     });
 
+    /* ---------- Revoke / delete / edit ---------- */
+
+    const csrfToken = <?= json_encode($csrf) ?>;
+
+    document.querySelectorAll('.js-confirm-form').forEach(function (form) {
+        form.addEventListener('submit', function (event) {
+            event.preventDefault();
+
+            openConfirm({
+                title: form.dataset.title,
+                message: form.dataset.message,
+                confirmText: form.dataset.button,
+                danger: true
+            }).then(function (confirmed) {
+                if (confirmed) {
+                    form.submit();
+                }
+            });
+        });
+    });
+
     document.querySelectorAll('.revokeMember').forEach(function (button) {
         button.addEventListener('click', function () {
-            if (!confirm('Revoke this team member access?')) {
-                return;
-            }
+            const name = button.dataset.name || 'This team member';
+            const isStaff = button.dataset.type === 'staff_assignment';
 
-            const form = document.createElement('form');
-            form.method = 'post';
+            openConfirm({
+                title: 'Revoke access?',
+                message: isStaff
+                    ? name + ' will no longer be able to check in tickets for your events. You can delete them afterwards.'
+                    : name + ' will lose access to your organization. You can delete them afterwards.',
+                confirmText: 'Revoke access',
+                danger: true
+            }).then(function (confirmed) {
+                if (!confirmed) {
+                    return;
+                }
 
-            const fields = {
-                csrf_token: <?= json_encode($csrf) ?>,
-                action: 'revoke_member',
-                member_id: button.dataset.id,
-                member_type: button.dataset.type || 'team_member'
-            };
-
-            Object.entries(fields).forEach(function ([name, value]) {
-                const input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = name;
-                input.value = value;
-                form.appendChild(input);
+                postAction({
+                    csrf_token: csrfToken,
+                    action: 'revoke_member',
+                    member_id: button.dataset.id,
+                    member_type: button.dataset.type || 'team_member'
+                });
             });
+        });
+    });
 
-            document.body.appendChild(form);
-            form.submit();
+    document.querySelectorAll('.deleteMember').forEach(function (button) {
+        button.addEventListener('click', function () {
+            const name = button.dataset.name || 'This team member';
+            const isStaff = button.dataset.type === 'staff_assignment';
+
+            openConfirm({
+                title: 'Delete ' + name + '?',
+                message: isStaff
+                    ? 'This permanently removes them from your events. Their staff account is also deleted if it is not assigned to any other event. This cannot be undone.'
+                    : 'This permanently removes them from your team. This cannot be undone.',
+                confirmText: 'Delete',
+                danger: true
+            }).then(function (confirmed) {
+                if (!confirmed) {
+                    return;
+                }
+
+                postAction({
+                    csrf_token: csrfToken,
+                    action: 'delete_member',
+                    member_id: button.dataset.id,
+                    member_type: button.dataset.type || 'team_member'
+                });
+            });
         });
     });
 
     document.querySelectorAll('.editRole').forEach(function (button) {
         button.addEventListener('click', function () {
-            alert('Role editing will be added in a separate step.');
+            openConfirm({
+                title: 'Edit role',
+                message: 'Role editing will be added in a separate step.',
+                confirmText: 'OK',
+                infoOnly: true
+            });
         });
     });
 
