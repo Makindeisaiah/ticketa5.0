@@ -1,4 +1,3 @@
-
 <?php
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
@@ -24,10 +23,95 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
 | Do not create a new database schema just for this page.
 */
 
-// TODO: Insert your EXISTING event and ticket database queries here.
-// Do not leave these variables undefined.
-$event = $event ?? null;
-$ticketTypes = $ticketTypes ?? [];
+// Load the event and ticket types from the existing Ticketa database.
+require_once __DIR__ . '/config/database.php';
+
+$event = null;
+$ticketTypes = [];
+$databaseError = false;
+$eventId = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
+
+if ($eventId && $eventId > 0) {
+    try {
+        $eventStmt = $pdo->prepare("
+            SELECT e.*, c.name AS category_name
+            FROM events e
+            LEFT JOIN categories c ON c.id = e.category_id
+            WHERE e.id = :id AND e.status = 'published'
+            LIMIT 1
+        ");
+        $eventStmt->execute(['id' => $eventId]);
+        $row = $eventStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($row) {
+            $timestamp = !empty($row['event_date']) ? strtotime($row['event_date']) : false;
+            $image = trim((string) ($row['image_url'] ?? ''));
+            if ($image === '') {
+                $image = 'assets/images/event-placeholder.jpg';
+            }
+
+            $event = [
+                'id' => (int) $row['id'],
+                'title' => (string) ($row['title'] ?? 'Event'),
+                'description' => (string) ($row['description'] ?? ''),
+                'event_date' => $timestamp ? date('F j, Y', $timestamp) : '',
+                'event_time' => $timestamp ? date('g:i A', $timestamp) : '',
+                'venue' => (string) ($row['venue'] ?? ''),
+                'city' => (string) ($row['city'] ?? ''),
+                'address' => (string) ($row['address'] ?? ''),
+                'image' => $image,
+                'category' => (string) ($row['category_name'] ?? ''),
+                'organizer_name' => '',
+            ];
+
+            // Organizer display is optional; event and ticket data still load if unavailable.
+            if (!empty($row['organizer_id'])) {
+                try {
+                    $organizerStmt = $pdo->prepare(
+                        'SELECT name FROM organizers WHERE id = :id LIMIT 1'
+                    );
+                    $organizerStmt->execute(['id' => (int) $row['organizer_id']]);
+                    $organizerName = $organizerStmt->fetchColumn();
+                    if ($organizerName !== false) {
+                        $event['organizer_name'] = (string) $organizerName;
+                    }
+                } catch (PDOException $organizerError) {
+                    error_log('Ticketa organizer lookup error: ' . $organizerError->getMessage());
+                }
+            }
+
+            $ticketStmt = $pdo->prepare("
+                SELECT
+                    tt.id,
+                    tt.name,
+                    tt.price,
+                    GREATEST(
+                        tt.quantity_total
+                        - tt.quantity_sold
+                        - COALESCE(reserved.reserved_quantity, 0),
+                        0
+                    ) AS available_quantity
+                FROM ticket_types tt
+                LEFT JOIN (
+                    SELECT ticket_type_id, SUM(quantity) AS reserved_quantity
+                    FROM ticket_inventory_reservations
+                    WHERE status = 'pending'
+                      AND expires_at > NOW()
+                    GROUP BY ticket_type_id
+                ) reserved ON reserved.ticket_type_id = tt.id
+                WHERE tt.event_id = :event_id
+                  AND tt.is_active = 1
+                ORDER BY tt.price ASC, tt.id ASC
+            ");
+            $ticketStmt->execute(['event_id' => $eventId]);
+            $ticketTypes = $ticketStmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+    } catch (PDOException $e) {
+        error_log('Ticketa event details database error: ' . $e->getMessage());
+        $databaseError = true;
+        http_response_code(500);
+    }
+}
 
 function eventEscape($value)
 {
@@ -35,6 +119,16 @@ function eventEscape($value)
 }
 
 $eventIsAvailable = is_array($event) && !empty($event['id']);
+$allTicketTypesSoldOut = !empty($ticketTypes);
+
+if ($allTicketTypesSoldOut) {
+    foreach ($ticketTypes as $ticketType) {
+        if ((int) ($ticketType['available_quantity'] ?? 0) > 0) {
+            $allTicketTypesSoldOut = false;
+            break;
+        }
+    }
+}
 
 $pageTitle = $eventIsAvailable
     ? (string) ($event['title'] ?? 'Event') . ' | TICKETA'
@@ -92,15 +186,64 @@ if ($eventIsAvailable) {
 require __DIR__ . '/includes/header.php';
 ?>
 
+<style>
+    /* Sold-out presentation only; event queries and checkout logic remain unchanged. */
+    .event-details-page .tickets-unavailable.event-sold-out {
+        border: 1px solid #fecaca;
+        border-radius: 12px;
+        padding: 22px 18px;
+        background: #fff5f5;
+        text-align: center;
+    }
+
+    .event-details-page .tickets-unavailable.event-sold-out::before {
+        content: 'SOLD OUT';
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 12px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: #dc2626;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: .08em;
+    }
+
+    .event-details-page .tickets-unavailable.event-sold-out h3 {
+        margin: 0 0 8px;
+        color: #991b1b;
+        font-size: 22px;
+        font-weight: 750;
+    }
+
+    .event-details-page .tickets-unavailable.event-sold-out p {
+        margin: 0;
+        color: #7f1d1d;
+        line-height: 1.6;
+    }
+
+    .event-details-page .ticket-sold-out {
+        display: inline-flex;
+        align-items: center;
+        padding: 5px 9px;
+        border-radius: 999px;
+        background: #fee2e2;
+        color: #b91c1c;
+        font-size: 12px;
+        font-weight: 700;
+    }
+</style>
+
 <main class="event-details-page">
 
     <?php if (!$eventIsAvailable): ?>
 
         <section class="event-not-found">
-            <h1>Event unavailable</h1>
+            <h1><?= !empty($databaseError) ? 'Unable to load event' : 'Event unavailable' ?></h1>
             <p>
-                We couldn't load this event. Please return to the events page
-                and try again.
+                <?= !empty($databaseError) ? 'We could not load event information right now. Please try again.' : "We couldn't find this published event. Please return to the events page and try again." ?>
             </p>
             <a class="event-primary-button" href="events.php">
                 Browse Events
@@ -241,6 +384,16 @@ require __DIR__ . '/includes/header.php';
                             </p>
                         </div>
 
+                    <?php elseif ($allTicketTypesSoldOut): ?>
+
+                        <div class="tickets-unavailable event-sold-out">
+                            <h3>Sold Out</h3>
+                            <p>
+                                All tickets for this event have been sold or are
+                                currently reserved. Please check back later.
+                            </p>
+                        </div>
+
                     <?php else: ?>
 
                         <form
@@ -378,5 +531,56 @@ require __DIR__ . '/includes/header.php';
     <?php endif; ?>
 
 </main>
+
+
+<script>
+(function () {
+    const form = document.getElementById('ticketSelectionForm');
+    if (!form) return;
+
+    const inputs = Array.from(form.querySelectorAll('[data-ticket-quantity]'));
+    const total = document.getElementById('ticketSelectionTotal');
+    const submit = document.getElementById('continueToCheckout');
+    const message = document.getElementById('ticketSelectionMessage');
+    const money = value => new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 0 }).format(value) + ' XOF';
+
+    function update() {
+        let amount = 0;
+        let count = 0;
+        inputs.forEach(input => {
+            const max = Math.max(0, parseInt(input.max || '0', 10) || 0);
+            let qty = parseInt(input.value || '0', 10);
+            if (!Number.isFinite(qty)) qty = 0;
+            qty = Math.max(0, Math.min(max, qty));
+            input.value = String(qty);
+            amount += qty * Math.max(0, parseInt(input.dataset.price || '0', 10) || 0);
+            count += qty;
+        });
+        if (total) total.textContent = money(amount);
+        if (submit) submit.disabled = count === 0;
+        if (message) message.textContent = count ? count + (count === 1 ? ' ticket selected.' : ' tickets selected.') : '';
+    }
+
+    form.querySelectorAll('.quantity-btn').forEach(button => {
+        button.addEventListener('click', () => {
+            const wrap = button.closest('.ticket-quantity');
+            const input = wrap ? wrap.querySelector('[data-ticket-quantity]') : null;
+            if (!input || input.disabled) return;
+            const current = parseInt(input.value || '0', 10) || 0;
+            const max = parseInt(input.max || '0', 10) || 0;
+            input.value = String(button.dataset.action === 'increase' ? Math.min(max, current + 1) : Math.max(0, current - 1));
+            update();
+        });
+    });
+    inputs.forEach(input => input.addEventListener('input', update));
+    form.addEventListener('submit', event => {
+        if (!inputs.some(input => (parseInt(input.value || '0', 10) || 0) > 0)) {
+            event.preventDefault();
+            if (message) message.textContent = 'Please select at least one ticket.';
+        }
+    });
+    update();
+})();
+</script>
 
 <?php require __DIR__ . '/includes/footer.php'; ?>

@@ -1,10 +1,8 @@
-
 <?php
 declare(strict_types=1);
 
-// Prefer environment variables configured in your hosting control panel.
 return [
-    'secret_key' => getenv('PAYSTACK_SECRET_KEY') ?: '',
+    'secret_key' => 'sk_test_3db0889c1df525849db34a0e5d5b18888131eec7',
     'currency' => 'XOF',
-    'callback_url' => getenv('PAYSTACK_CALLBACK_URL') ?: '',
+    'callback_url' => 'https://localhost/ticketa/verify-payment.php',
 ];

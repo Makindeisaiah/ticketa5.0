@@ -1,0 +1,270 @@
+:root {
+    --staff-sidebar-width: 250px;
+    --staff-teal: #10bea0;
+    --staff-teal-dark: #079b84;
+    --staff-text: #202124;
+    --staff-muted: #777b80;
+    --staff-border: #e7e8ea;
+}
+
+.staff-sidebar,
+.staff-sidebar * {
+    box-sizing: border-box;
+}
+
+.staff-sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 100;
+    width: var(--staff-sidebar-width);
+    height: 100vh;
+    height: 100dvh;
+    padding: 25px 24px 20px;
+    background: #fff;
+    border-right: 1px solid var(--staff-border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+    font-family: Inter, Arial, sans-serif;
+}
+
+.staff-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 38px;
+    margin-bottom: 54px;
+    color: var(--staff-text);
+    text-decoration: none;
+}
+
+.staff-brand-mark {
+    width: 40px;
+    height: 32px;
+    flex-shrink: 0;
+    border: 3px solid var(--staff-teal);
+    border-radius: 6px;
+    color: var(--staff-teal);
+    display: grid;
+    place-items: center;
+    font-size: 24px;
+    font-weight: 700;
+}
+
+.staff-brand-name {
+    font-size: 25px;
+    font-weight: 600;
+    letter-spacing: -0.8px;
+}
+
+.staff-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+
+.staff-nav-link {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    min-height: 46px;
+    padding: 12px 16px;
+    border-radius: 3px;
+    color: #707276;
+    text-decoration: none;
+    font-size: 15px;
+    transition: background 0.18s ease, color 0.18s ease;
+}
+
+.staff-nav-link:hover {
+    background: #effbf8;
+    color: var(--staff-teal-dark);
+}
+
+.staff-nav-link.active {
+    background: var(--staff-teal);
+    color: #fff;
+}
+
+.staff-nav-icon {
+    width: 22px;
+    flex: 0 0 22px;
+    text-align: center;
+    font-size: 20px;
+}
+
+.staff-nav-label {
+    min-width: 0;
+    white-space: nowrap;
+}
+
+.staff-profile {
+    margin-top: auto;
+    padding: 14px;
+    border: 1px solid #d8dadd;
+    border-radius: 10px;
+    background: #fff;
+}
+
+.staff-profile-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.staff-avatar {
+    width: 39px;
+    height: 39px;
+    flex: 0 0 39px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #e2f7f3;
+    color: #168d7b;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.staff-profile-copy {
+    min-width: 0;
+}
+
+.staff-profile-copy strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--staff-text);
+}
+
+.staff-profile-copy small {
+    display: block;
+    margin-top: 5px;
+    color: var(--staff-muted);
+    font-size: 12px;
+}
+
+.staff-online {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0;
+    padding-left: 3px;
+    color: var(--staff-muted);
+    font-size: 12px;
+}
+
+.staff-online-dot {
+    width: 9px;
+    height: 9px;
+    flex: 0 0 9px;
+    border-radius: 50%;
+    background: var(--staff-teal);
+}
+
+.staff-signout-form {
+    margin: 0;
+    padding-top: 10px;
+    border-top: 1px solid var(--staff-border);
+}
+
+.staff-signout {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 2px 0;
+    border: 0;
+    background: transparent;
+    color: #777;
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+}
+
+.staff-signout:hover {
+    color: #d14343;
+}
+
+.staff-signout-icon {
+    font-size: 21px;
+}
+
+@media (max-width: 1150px) {
+    :root {
+        --staff-sidebar-width: 215px;
+    }
+
+    .staff-sidebar {
+        padding: 22px 16px 16px;
+    }
+
+    .staff-nav {
+        gap: 16px;
+    }
+
+    .staff-brand {
+        margin-bottom: 38px;
+    }
+}
+
+@media (max-width: 900px) {
+    :root {
+        --staff-sidebar-width: 76px;
+    }
+
+    .staff-sidebar {
+        align-items: center;
+        padding: 20px 9px;
+    }
+
+    .staff-brand {
+        justify-content: center;
+        margin-bottom: 35px;
+    }
+
+    .staff-brand-name,
+    .staff-nav-label,
+    .staff-profile-copy,
+    .staff-online .staff-profile-copy,
+    .staff-signout-label {
+        display: none;
+    }
+
+    .staff-nav {
+        width: 100%;
+        gap: 14px;
+    }
+
+    .staff-nav-link {
+        justify-content: center;
+        padding: 13px 4px;
+    }
+
+    .staff-profile {
+        width: 100%;
+        padding: 9px 5px;
+    }
+
+    .staff-profile-top {
+        justify-content: center;
+    }
+
+    .staff-online {
+        justify-content: center;
+    }
+
+    .staff-signout {
+        justify-content: center;
+    }
+}
+
+@media (max-width: 560px) {
+    .staff-sidebar {
+        display: none;
+    }
+}

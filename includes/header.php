@@ -56,7 +56,7 @@ if (!isset($pageStyles) || !is_array($pageStyles)) {
                     Browse Events
                 </a>
 
-                <a href="index.php#how-it-works" data-i18n="nav_how">
+                <a href="my-tickets.php" data-i18n="nav_how">
                     How it works
                 </a>
 
